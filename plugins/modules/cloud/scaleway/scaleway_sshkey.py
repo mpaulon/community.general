@@ -3,6 +3,7 @@
 #
 # Scaleway SSH keys management module
 #
+# Copyright (C) 2022 Michaël PAULON <michael+ansible@paulon.org>
 # Copyright (C) 2018 Online SAS.
 # https://www.scaleway.com
 #
@@ -26,6 +27,10 @@ extends_documentation_fragment:
 
 
 options:
+  name:
+    type: str
+    description:
+      - Name of the SSH key
   state:
     type: str
     description:
@@ -39,30 +44,26 @@ options:
     description:
      - The public SSH key as a string to add.
     required: true
-  api_url:
+  project:
     type: str
     description:
-      - Scaleway API URL
-    default: 'https://account.scaleway.com'
-    aliases: ['base_url']
+      - Project identifier.
 '''
 
 EXAMPLES = '''
-- name: "Add SSH key"
+- name: "Add SSH key named example"
   community.general.scaleway_sshkey:
+    name: example
     ssh_pub_key: "ssh-rsa AAAA..."
     state: "present"
+    project: 951df375-e094-4d26-97c1-ba548eeb9c42
 
 - name: "Delete SSH key"
   community.general.scaleway_sshkey:
+    name: example
     ssh_pub_key: "ssh-rsa AAAA..."
     state: "absent"
-
-- name: "Add SSH key with explicit token"
-  community.general.scaleway_sshkey:
-    ssh_pub_key: "ssh-rsa AAAA..."
-    state: "present"
-    oauth_token: "6ecd2c9b-6f4f-44d4-a187-61a92078d08c"
+    project: 951df375-e094-4d26-97c1-ba548eeb9c42
 '''
 
 RETURN = '''
@@ -80,93 +81,86 @@ data:
 from ansible.module_utils.basic import AnsibleModule, env_fallback
 from ansible_collections.community.general.plugins.module_utils.scaleway import scaleway_argument_spec, Scaleway
 
-
-def extract_present_sshkeys(raw_organization_dict):
-    ssh_key_list = raw_organization_dict["organizations"][0]["users"][0]["ssh_public_keys"]
-    ssh_key_lookup = [ssh_key["key"] for ssh_key in ssh_key_list]
-    return ssh_key_lookup
-
-
-def extract_user_id(raw_organization_dict):
-    return raw_organization_dict["organizations"][0]["users"][0]["id"]
-
-
-def sshkey_user_patch(ssh_lookup):
-    ssh_list = {"ssh_public_keys": [{"key": key}
-                                    for key in ssh_lookup]}
-    return ssh_list
-
+def extract_matching_keys(sshkeys_json, name, key, project):
+    return {
+        k["id"]: (k["name"], k["public_key"]) for k in sshkeys_json["ssh_keys"] if
+        (k["name"] == name or k["public_key"] == key) and k["project_id"] == project
+    }
 
 def core(module):
-    ssh_pub_key = module.params['ssh_pub_key']
-    state = module.params["state"]
-    account_api = Scaleway(module)
-    response = account_api.get('organizations')
+    key_state = module.params["state"]
+    key = module.params["ssh_pub_key"]
+    name = module.params["name"]
+    project = module.params["project"]
 
-    status_code = response.status_code
-    organization_json = response.json
+    ENDPOINT = "account/v2alpha1/ssh-keys"
+    api = Scaleway(module=module)
+
+    response  = api.get(ENDPOINT)
+    sshkeys_json = response.json
 
     if not response.ok:
-        module.fail_json(msg='Error getting ssh key [{0}: {1}]'.format(
-            status_code, response.json['message']))
+        module.fail_json(msg='Error getting ssh keys [{0}: {1}]'.format(
+            response.status_code, response.json['message']))
 
-    user_id = extract_user_id(organization_json)
-    present_sshkeys = []
     try:
-        present_sshkeys = extract_present_sshkeys(organization_json)
+        matching_keys = extract_matching_keys(sshkeys_json, name=name, key=key, project=project)
     except (KeyError, IndexError) as e:
-        module.fail_json(changed=False, data="Error while extracting present SSH keys from API")
+        module.fail_json(msg="Error while extracting present SSH keys from API")
 
-    if state in ('present',):
-        if ssh_pub_key in present_sshkeys:
+    if key_state == "present":
+        if (name, key) in list(matching_keys.values()):
+            module.exit_json(changed=False)
+        else:
+            if module.check_mode:
+                module.exit_json(changed=True)
+            data = {
+                "name": name,
+                "public_key": key,
+                "project_id": project
+            }
+
+            response = api.post(ENDPOINT, data=data)
+            if response.ok:
+                module.exit_json(changed=True, msg=response.json)
+            module.fail_json(msg='Error creating ssh key [{0}: {1}]'.format(
+                response.status_code, response.json))
+        
+        # TODO: add feature to update keys
+
+    if key_state == "absent":
+        if (name, key) in list(matching_keys.values()):
+            if module.check_mode:
+                module.exit_json(changed=True)
+            id = matching_keys.keys()[matching_keys.values().index((name, key))]
+            response = api.delete("{}/{}".format(ENDPOINT, id))
+            if response.ok:
+                module.exit_json(changed=True, data=response.json)
+            module.fail_json(msg='Error deleting ssh key [{0}: {1}]'.format(
+                response.status_code, response.json))
+        else:
             module.exit_json(changed=False)
 
-        # If key not found create it!
-        if module.check_mode:
-            module.exit_json(changed=True)
-
-        present_sshkeys.append(ssh_pub_key)
-        payload = sshkey_user_patch(present_sshkeys)
-
-        response = account_api.patch('/users/%s' % user_id, data=payload)
-
-        if response.ok:
-            module.exit_json(changed=True, data=response.json)
-
-        module.fail_json(msg='Error creating ssh key [{0}: {1}]'.format(
-            response.status_code, response.json))
-
-    elif state in ('absent',):
-        if ssh_pub_key not in present_sshkeys:
-            module.exit_json(changed=False)
-
-        if module.check_mode:
-            module.exit_json(changed=True)
-
-        present_sshkeys.remove(ssh_pub_key)
-        payload = sshkey_user_patch(present_sshkeys)
-
-        response = account_api.patch('/users/%s' % user_id, data=payload)
-
-        if response.ok:
-            module.exit_json(changed=True, data=response.json)
-
-        module.fail_json(msg='Error deleting ssh key [{0}: {1}]'.format(
-            response.status_code, response.json))
-
+    module.fail_json(msg='Invalid state {}'.format(key_state))    
 
 def main():
     argument_spec = scaleway_argument_spec()
     argument_spec.update(dict(
-        state=dict(default='present', choices=['absent', 'present']),
-        ssh_pub_key=dict(required=True),
-        api_url=dict(fallback=(env_fallback, ['SCW_API_URL']), default='https://account.scaleway.com', aliases=['base_url']),
+        state=dict(choices=['absent', 'present'], default='present'),
+        ssh_pub_key=dict(),
+        name=dict(),
+        project=dict(required=True),
     ))
     module = AnsibleModule(
         argument_spec=argument_spec,
         supports_check_mode=True,
+        required_one_of=[
+            ('name', 'ssh_pub_key'),
+        ],
+        required_if=[
+            ('state', 'present', ('name', 'ssh_pub_key'))
+        ]
     )
-
     core(module)
 
 
